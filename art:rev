@@ -1,0 +1,668 @@
+"""
+generate_figures_v3.py
+BESPOKE publication-grade figures. No overlap. No generic chart types.
+Every panel is designed as a visual argument.
+"""
+import os, warnings, itertools
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import Circle, Wedge, Rectangle, FancyBboxPatch, Polygon
+from matplotlib.lines import Line2D
+from matplotlib.colors import LinearSegmentedColormap, to_rgb
+import matplotlib.gridspec as gridspec
+from matplotlib import patheffects as pe
+from scipy.cluster.hierarchy import dendrogram, linkage, leaves_list
+from scipy.spatial.distance import pdist
+
+warnings.filterwarnings("ignore")
+os.makedirs("figures", exist_ok=True)
+
+# ============================================================
+# GLOBAL STYLE
+# ============================================================
+plt.rcParams.update({
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "font.size": 9, "axes.titlesize": 10, "axes.labelsize": 9,
+    "axes.linewidth": 0.8, "xtick.labelsize": 8, "ytick.labelsize": 8,
+    "legend.fontsize": 8, "legend.frameon": False,
+    "figure.dpi": 200, "savefig.dpi": 600,
+    "savefig.bbox": "tight", "savefig.pad_inches": 0.03,
+    "pdf.fonttype": 42, "ps.fonttype": 42,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "xtick.direction": "out", "ytick.direction": "out",
+})
+
+OI = {"orange": "#E69F00", "sky": "#56B4E9", "green": "#009E73",
+      "yellow": "#F0E442", "blue": "#0072B2", "red": "#D55E00",
+      "purple": "#CC79A7", "grey": "#999999", "black": "#000000",
+      "lightgrey": "#E6E6E6", "sand": "#F5F0E1"}
+
+SPECIES_COLOR = {"C. maritimum": OI["red"], "S. europaea": OI["blue"]}
+LAYER_COLOR   = {"Metabolomics": OI["red"], "Proteomics": OI["blue"], "Microbiome": OI["green"]}
+LAYER_ORDER   = ["Metabolomics", "Proteomics", "Microbiome"]
+SPECIES_ORDER = ["C. maritimum", "S. europaea"]
+
+# ============================================================
+# HARD-CODED TABLE
+# ============================================================
+records = [
+    dict(ID="CM_M1", Species="C. maritimum", Layer="Metabolomics",
+         Months=6, MonthsList=[3,4,5,6,7,8], SalinityControl=False,
+         Depth=12, Quality=3, Year=2018),
+    dict(ID="CM_M2", Species="C. maritimum", Layer="Metabolomics",
+         Months=12, MonthsList=list(range(1,13)), SalinityControl=False,
+         Depth=18, Quality=3, Year=2024),
+    dict(ID="CM_M3", Species="C. maritimum", Layer="Metabolomics",
+         Months=1, MonthsList=[7], SalinityControl=False,
+         Depth=35, Quality=2, Year=2024),
+    dict(ID="CM_M4", Species="C. maritimum", Layer="Metabolomics",
+         Months=1, MonthsList=[6], SalinityControl=False,
+         Depth=22, Quality=2, Year=2023),
+    dict(ID="CM_B1", Species="C. maritimum", Layer="Microbiome",
+         Months=1, MonthsList=[5], SalinityControl=False,
+         Depth=115, Quality=2, Year=2020),
+    dict(ID="SE_M1", Species="S. europaea", Layer="Metabolomics",
+         Months=1, MonthsList=[8], SalinityControl=True,
+         Depth=552, Quality=4, Year=2023),
+    dict(ID="SE_P1", Species="S. europaea", Layer="Proteomics",
+         Months=1, MonthsList=[7], SalinityControl=True,
+         Depth=111, Quality=3, Year=2009),
+    dict(ID="SE_P2", Species="S. europaea", Layer="Proteomics",
+         Months=1, MonthsList=[7], SalinityControl=True,
+         Depth=66, Quality=3, Year=2011),
+    dict(ID="SE_B1", Species="S. europaea", Layer="Microbiome",
+         Months=1, MonthsList=[9], SalinityControl=False,
+         Depth=1138, Quality=3, Year=2018),
+]
+df = pd.DataFrame(records)
+
+
+# ============================================================
+# FIGURE 1 — "EVIDENCE RADAR": concentric-ring progress glyphs
+# ============================================================
+def figure1():
+    """
+    A 2×3 grid (species × layer). Each cell shows:
+    - 4 concentric arcs (records, months, salinity, depth) — the "radar"
+    - the cell title is the species–layer pair
+    - a shared legend explains the 4 arcs
+    Absence is rendered as a dashed empty circle in red.
+    """
+    metrics = {
+        "records": dict(max=4,        unit="records"),
+        "months":  dict(max=12,       unit="months"),
+        "salinity":dict(max=1,        unit="binary"),
+        "depth":   dict(max=np.log10(1200), unit="log$_{10}$ depth"),
+    }
+    metric_colors = {"records": OI["blue"], "months": OI["orange"],
+                     "salinity": OI["green"], "depth": OI["purple"]}
+
+    fig = plt.figure(figsize=(11.5, 7.2), constrained_layout=True)
+    gs = gridspec.GridSpec(2, 3, figure=fig, wspace=0.28, hspace=0.30,
+                           height_ratios=[1, 1])
+
+    for i, sp in enumerate(SPECIES_ORDER):
+        for j, layer in enumerate(LAYER_ORDER):
+            ax = fig.add_subplot(gs[i, j], aspect="equal")
+            ax.set_xlim(-1.15, 1.15); ax.set_ylim(-1.15, 1.15)
+            ax.axis("off")
+
+            sub = df[(df.Species == sp) & (df.Layer == layer)]
+            n_rec    = len(sub)
+            max_mo   = sub.Months.max() if n_rec else 0
+            has_sal  = bool(sub.SalinityControl.any()) if n_rec else False
+            max_dep  = sub.Depth.max() if n_rec else 0
+            depth_log = np.log10(max_dep) if max_dep > 0 else 0
+
+            # Glyph geometry: 4 concentric rings, radii 0.95, 0.72, 0.49, 0.26
+            radii = [0.95, 0.72, 0.49, 0.26]
+            vals  = [n_rec / metrics["records"]["max"],
+                     max_mo / metrics["months"]["max"],
+                     1.0 if has_sal else 0.0,
+                     depth_log / metrics["depth"]["max"]]
+            keys  = ["records", "months", "salinity", "depth"]
+
+            if n_rec == 0:
+                # Absence: dashed red circle
+                ax.add_patch(Circle((0, 0), 1.02, fill=False,
+                                    edgecolor=OI["red"], lw=1.4, ls=(0, (2, 2))))
+                ax.text(0, 0, "ABSENT", ha="center", va="center",
+                        fontsize=10, fontweight="bold", color=OI["red"])
+            else:
+                # Grey background ring
+                for r in radii:
+                    ax.add_patch(Circle((0, 0), r, fill=False,
+                                        edgecolor=OI["lightgrey"], lw=6, alpha=0.6))
+                # Filled arcs proportional to values, STARTING AT 12 o'clock, CW
+                for r, v, k in zip(radii, vals, keys):
+                    if v <= 0: continue
+                    start = 90
+                    end   = 90 - 360 * v
+                    theta = np.linspace(np.deg2rad(start), np.deg2rad(end), 120)
+                    xs = r * np.cos(theta)
+                    ys = r * np.sin(theta)
+                    ax.plot(xs, ys, color=metric_colors[k], lw=6,
+                            solid_capstyle="round", zorder=3)
+                # Inner value text
+                ax.text(0, 0.13, f"{n_rec}", ha="center", va="center",
+                        fontsize=14, fontweight="bold")
+                ax.text(0, -0.13, f"rec", ha="center", va="center",
+                        fontsize=8, color="dimgrey")
+                # Compact numeric annotations at ring ends
+                ax.text(0, -1.16, f"months: {max_mo}  ·  depth: {max_dep}",
+                        ha="center", va="center", fontsize=7.5,
+                        color="dimgrey")
+
+            # Panel title
+            title_color = SPECIES_COLOR[sp]
+            ax.text(0, 1.20, f"{sp}", ha="center", va="bottom",
+                    fontsize=9.5, fontweight="bold", color=title_color)
+            ax.text(0, 1.10, layer, ha="center", va="bottom",
+                    fontsize=8, color="dimgrey", style="italic")
+
+    # Shared legend at bottom
+    legend_elements = [
+        Line2D([0], [0], color=metric_colors["records"], lw=5,
+               label="Records (max 4)"),
+        Line2D([0], [0], color=metric_colors["months"], lw=5,
+               label="Seasonal resolution (max 12 mo)"),
+        Line2D([0], [0], color=metric_colors["salinity"], lw=5,
+               label="Salinity-controlled (binary)"),
+        Line2D([0], [0], color=metric_colors["depth"], lw=5,
+               label="Analytical depth (log$_{10}$, max 1200 features)"),
+        Line2D([0], [0], color=OI["red"], lw=1.4, ls=(0, (2, 2)),
+               label="Layer absent from corpus"),
+    ]
+    fig.legend(handles=legend_elements, loc="lower center",
+               ncol=5, fontsize=8, bbox_to_anchor=(0.5, -0.02),
+               handlelength=1.6, columnspacing=1.8)
+
+    fig.suptitle("Evidence radar: the integration deficit at species × layer resolution",
+                 fontsize=12, fontweight="bold", y=1.02)
+
+    plt.savefig("figures/fig1_evidence_radar.pdf")
+    plt.savefig("figures/fig1_evidence_radar.png", dpi=600)
+    plt.close()
+    print("Fig 1 saved")
+
+
+# ============================================================
+# FIGURE 2 — "ATTRIBUTE LATTICE": bipartite network with red void
+# ============================================================
+def figure2():
+    """
+    9 records on the left, 7 attributes on the right. Edges connect each
+    record to the attributes it has. The empty "seasonal + salinity"
+    intersection is rendered as a red void at the top-right of the
+    attribute column, with an explicit label.
+    """
+    attributes = [
+        "C. maritimum", "S. europaea",
+        "Metabolomics", "Proteomics", "Microbiome",
+        "Seasonal (≥6 mo)", "Salinity-controlled",
+    ]
+    record_attrs = {
+        "CM_M1": ["C. maritimum", "Metabolomics", "Seasonal (≥6 mo)"],
+        "CM_M2": ["C. maritimum", "Metabolomics", "Seasonal (≥6 mo)"],
+        "CM_M3": ["C. maritimum", "Metabolomics"],
+        "CM_M4": ["C. maritimum", "Metabolomics"],
+        "CM_B1": ["C. maritimum", "Microbiome"],
+        "SE_M1": ["S. europaea", "Metabolomics", "Salinity-controlled"],
+        "SE_P1": ["S. europaea", "Proteomics", "Salinity-controlled"],
+        "SE_P2": ["S. europaea", "Proteomics", "Salinity-controlled"],
+        "SE_B1": ["S. europaea", "Microbiome"],
+    }
+
+    fig, ax = plt.subplots(figsize=(11, 6.2), constrained_layout=True)
+    ax.set_xlim(-0.3, 5.8); ax.set_ylim(-0.5, len(attributes) + 0.8)
+    ax.axis("off")
+
+    # Layout
+    rec_x = 0.0
+    attr_x = 5.0
+    rec_y = {r: len(record_attrs) - i - 1 for i, r in enumerate(record_attrs)}
+    attr_y = {a: len(attributes) - i - 1 for i, a in enumerate(attributes)}
+
+    # Draw edges
+    for r, attrs in record_attrs.items():
+        for a in attrs:
+            y0, y1 = rec_y[r], attr_y[a]
+            color = SPECIES_COLOR["C. maritimum" if "C." in r else "S. europaea"]
+            # bezier curve
+            xs = np.linspace(rec_x, attr_x, 40)
+            t = np.linspace(0, 1, 40)
+            ys = (1-t)*y0 + t*y1 + 0.15 * np.sin(np.pi * t)
+            ax.plot(xs, ys, color=color, alpha=0.42, lw=1.0, zorder=1)
+
+    # Record nodes (left)
+    for r, y in rec_y.items():
+        sp = "C. maritimum" if "C." in r else "S. europaea"
+        ax.scatter(rec_x, y, s=260, color=SPECIES_COLOR[sp],
+                   edgecolor="black", lw=0.9, zorder=3)
+        ax.text(rec_x, y, r.replace("_", "\n"), ha="center", va="center",
+                fontsize=6.5, fontweight="bold", color="white", zorder=4,
+                linespacing=0.8)
+        ax.text(rec_x - 0.15, y, r, ha="right", va="center",
+                fontsize=8, fontweight="bold", zorder=4)
+
+    # Attribute nodes (right)
+    for a, y in attr_y.items():
+        n_in = sum(a in v for v in record_attrs.values())
+        color = (SPECIES_COLOR["C. maritimum"] if a == "C. maritimum"
+                 else SPECIES_COLOR["S. europaea"] if a == "S. europaea"
+                 else LAYER_COLOR.get(a, OI["grey"]))
+        ax.scatter(attr_x, y, s=60 + 45*n_in, color=color,
+                   edgecolor="black", lw=0.9, zorder=3)
+        ax.text(attr_x, y, str(n_in), ha="center", va="center",
+                fontsize=9, fontweight="bold", color="white", zorder=4)
+        ax.text(attr_x + 0.18, y, a, ha="left", va="center",
+                fontsize=9, fontweight="bold", zorder=4)
+
+    # Column headers
+    ax.text(rec_x, len(attributes) - 0.1, "9 verified records",
+            ha="center", va="bottom", fontsize=10, fontweight="bold")
+    ax.text(attr_x, len(attributes) - 0.1, "7 attributes",
+            ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    # RED VOID: the seasonal + salinity intersection
+    # (no record connects these two attributes)
+    y_seasonal = attr_y["Seasonal (≥6 mo)"]
+    y_salinity = attr_y["Salinity-controlled"]
+    # draw a red dashed arrow between them
+    ax.annotate(
+        "", xy=(attr_x, y_salinity), xytext=(attr_x, y_seasonal),
+        arrowprops=dict(arrowstyle="<->", color=OI["red"], lw=2.2,
+                        linestyle=(0, (3, 2))),
+        zorder=5,
+    )
+    ax.text(attr_x + 1.55, (y_seasonal + y_salinity)/2,
+            "EMPTY\nINTERSECTION\n(no study has\nboth attributes)",
+            ha="left", va="center", fontsize=8.5, fontweight="bold",
+            color=OI["red"], linespacing=1.1,
+            bbox=dict(boxstyle="round,pad=0.35", fc="mistyrose",
+                      ec=OI["red"], lw=0.9))
+
+    ax.set_title("Attribute lattice: the seasonal × salinity void",
+                 fontsize=12, fontweight="bold", pad=8)
+
+    plt.savefig("figures/fig2_attribute_lattice.pdf")
+    plt.savefig("figures/fig2_attribute_lattice.png", dpi=600)
+    plt.close()
+    print("Fig 2 saved")
+
+
+# ============================================================
+# FIGURE 3 — "DEPTH–QUALITY QUADRANT": named territories + funnel
+# ============================================================
+def figure3():
+    """
+    Left: quadrant scatter with named territories, points clustered into
+    coloured blobs with labels *inside* the blobs (no leader lines).
+    Right: funnel showing proteomic coverage gap from 2-DE to modern shotgun.
+    """
+    fig = plt.figure(figsize=(13, 6.2), constrained_layout=True)
+    gs = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[2.0, 1.0], wspace=0.18)
+
+    # ----- LEFT PANEL: quadrant -----
+    ax = fig.add_subplot(gs[0, 0])
+    ax.set_xlim(1.3, 4.35); ax.set_ylim(30, 3000)
+    ax.set_yscale("log")
+
+    # Quadrant shading
+    # Teritories named by (x, y) thresholds: qx = 3.0, qy = 200
+    qx, qy = 3.0, 200
+    ax.add_patch(Rectangle((1.3, qy), qx-1.3, 3000-qy,
+                           fc="#EAF2FA", ec="none", zorder=0, alpha=0.65))
+    ax.add_patch(Rectangle((qx, qy), 4.35-qx, 3000-qy,
+                           fc="#FDF3E7", ec="none", zorder=0, alpha=0.65))
+    ax.add_patch(Rectangle((1.3, 30), qx-1.3, qy-30,
+                           fc="#F0F0F0", ec="none", zorder=0, alpha=0.55))
+    ax.add_patch(Rectangle((qx, 30), 4.35-qx, qy-30,
+                           fc="#F4EAF2", ec="none", zorder=0, alpha=0.55))
+
+    # Territory labels
+    terr = [
+        (1.4, 2900, "PILOT TERRITORY", "low quality · high depth", "#5B7FA6"),
+        (qx+0.05, 2900, "FRONTIER TERRITORY", "high quality · high depth", "#B8783A"),
+        (1.4, 35, "LEGACY TERRITORY", "low quality · low depth", "#666666"),
+        (qx+0.05, 35, "FRAGILE TERRITORY", "high quality · low depth", "#9C5A8C"),
+    ]
+    for x, y, name, sub, col in terr:
+        ax.text(x, y, name, fontsize=8.5, fontweight="bold",
+                color=col, ha="left", va="top")
+        ax.text(x, y/1.55, sub, fontsize=7, color=col, ha="left", va="top",
+                style="italic")
+
+    # Points, grouped by layer with territorial jitter
+    for layer, grp in df.groupby("Layer"):
+        # jitter x by ±0.12 within quality value, and y by multiplicative factor
+        jx = grp.Quality + np.random.RandomState(0).uniform(-0.10, 0.10, len(grp))
+        jy = grp.Depth * np.random.RandomState(1).uniform(0.82, 1.18, len(grp))
+        ax.scatter(jx, jy, s=grp.Months*28 + 110,
+                   c=LAYER_COLOR[layer], alpha=0.82,
+                   edgecolors="black", linewidths=1.0,
+                   label=layer, zorder=3)
+
+    # Inside-point labels (no leader lines; text sits inside marker)
+    for _, r in df.iterrows():
+        ax.text(r.Quality, r.Depth, r.ID.replace("_", "\n"),
+                ha="center", va="center", fontsize=5.5,
+                fontweight="bold", color="white", zorder=4,
+                linespacing=0.85)
+
+    ax.set_xlabel("Reporting quality score (0–4)", fontweight="bold")
+    ax.set_ylabel("Analytical depth (features, log$_{10}$)", fontweight="bold")
+    ax.set_title("Territorial quadrant of the verified corpus",
+                 fontweight="bold", pad=8)
+    ax.set_xticks([1.5, 2.0, 2.5, 3.0, 3.5, 4.0])
+
+    # Quadrant gridlines
+    ax.axhline(qy, color="black", lw=0.7, ls=(0, (3, 3)), alpha=0.6, zorder=1)
+    ax.axvline(qx, color="black", lw=0.7, ls=(0, (3, 3)), alpha=0.6, zorder=1)
+
+    # Reference line
+    ax.axhline(2000, ls="--", color=OI["grey"], lw=0.8, alpha=0.8, zorder=1)
+    ax.text(1.36, 2200, "modern shotgun proteome benchmark (~2,000 proteins)",
+            fontsize=7, style="italic", color="dimgrey")
+
+    ax.legend(title="Layer", loc="lower right", fontsize=8,
+              title_fontsize=8.5, frameon=True, edgecolor="black",
+              framealpha=0.95, borderpad=0.5)
+    ax.grid(True, which="major", ls=":", alpha=0.35, zorder=0)
+
+    # ----- RIGHT PANEL: funnel -----
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.set_xlim(0, 4); ax2.set_ylim(0, 4)
+    ax2.axis("off")
+    ax2.set_title("Proteomic coverage gap", fontweight="bold", pad=8)
+
+    # Funnel stages
+    stages = [
+        ("Modern shotgun proteome\n(benchmark)", 2000, OI["green"]),
+        ("Metabolite count\n(SE_M1, Duan 2023)",   552, OI["sky"]),
+        ("Proteins identified\n(SE_P1, Wang 2009)", 111, OI["orange"]),
+        ("Proteins identified\n(SE_P2, Wang 2011)",  66, OI["red"]),
+    ]
+    max_val = stages[0][1]
+    y_positions = [3.4, 2.5, 1.6, 0.7]
+    bar_h = 0.55
+    for (label, val, col), y in zip(stages, y_positions):
+        w = 3.5 * (val / max_val) ** 0.35   # cube-root for visibility
+        ax2.add_patch(FancyBboxPatch((3.8 - w, y - bar_h/2), w, bar_h,
+                                     boxstyle="round,pad=0.02",
+                                     fc=col, ec="black", lw=0.7, alpha=0.85))
+        ax2.text(3.75 - w/2, y, f"{val:,}", ha="center", va="center",
+                 fontsize=11, fontweight="bold", color="white")
+        ax2.text(3.82, y, label, ha="left", va="center",
+                 fontsize=7.2, fontweight="bold", linespacing=0.9)
+
+    # Delta arrows
+    for y0, y1 in zip(y_positions[:-1], y_positions[1:]):
+        ax2.annotate("", xy=(0.4, y1 + 0.10), xytext=(0.4, y0 - 0.10),
+                     arrowprops=dict(arrowstyle="-|>", color="black",
+                                     lw=1.2))
+    ax2.text(0.2, np.mean(y_positions), "×30\ngap",
+             ha="center", va="center", fontsize=9, fontweight="bold",
+             color=OI["red"], rotation=90)
+
+    fig.suptitle("Depth–quality geometry and the proteomic coverage gap",
+                 fontsize=12, fontweight="bold", y=1.02)
+
+    plt.savefig("figures/fig3_quadrant_funnel.pdf")
+    plt.savefig("figures/fig3_quadrant_funnel.png", dpi=600)
+    plt.close()
+    print("Fig 3 saved")
+
+
+# ============================================================
+# FIGURE 4 — "SEASONAL RIBBON": radial ribbon + timeline strip
+# ============================================================
+def figure4():
+    """
+    Main panel: radial ribbon plot. 6 ribbons (species × layer), each split
+    into 12 month segments. Filled = sampled; hatched grey = not sampled.
+    Month labels placed OUTSIDE, ribbon labels placed in a legend (never
+    on the ribbons themselves).
+    Lower strip: the only seasonally sampled window (Popović 2024).
+    """
+    ribbons = [
+        ("C. maritimum", "Metabolomics", "#B2182B"),
+        ("C. maritimum", "Proteomics",   "#EF8A62"),
+        ("C. maritimum", "Microbiome",   "#FDDBC7"),
+        ("S. europaea",  "Metabolomics", "#2166AC"),
+        ("S. europaea",  "Proteomics",   "#67A9CF"),
+        ("S. europaea",  "Microbiome",   "#D1E5F0"),
+    ]
+    n_ribbons = len(ribbons)
+
+    fig = plt.figure(figsize=(9.5, 9.8), constrained_layout=True)
+    gs = gridspec.GridSpec(2, 1, height_ratios=[5.0, 1.0],
+                           hspace=0.10, figure=fig)
+
+    # ---- Main radial ribbon ----
+    ax = fig.add_subplot(gs[0, 0], projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    ax.set_facecolor("white")
+
+    n_months = 12
+    theta_centers = np.deg2rad(np.arange(0, 360, 360/n_months)) - np.deg2rad(15)
+    width = np.deg2rad(360/n_months) - np.deg2rad(1.2)
+
+    r0 = 0.30
+    r_w = 0.55
+    r_gap = 0.08
+
+    for i, (sp, layer, col) in enumerate(ribbons):
+        sub = df[(df.Species == sp) & (df.Layer == layer)]
+        covered = set()
+        for ml in sub.MonthsList:
+            covered.update(ml)
+        radius = r0 + i * (r_w + r_gap)
+        for m_idx, m_num in enumerate(range(1, 13)):
+            if m_num in covered:
+                ax.bar(theta_centers[m_idx], r_w, width=width, bottom=radius,
+                       color=col, edgecolor="white", lw=1.4, zorder=3)
+            else:
+                # hatched grey for "not sampled"
+                ax.bar(theta_centers[m_idx], r_w, width=width, bottom=radius,
+                       color="#F4F4F4", edgecolor="#CCCCCC", lw=0.6,
+                       hatch="////", zorder=2)
+
+    # Outer ring: labels of months
+    ax.set_xticks(theta_centers)
+    ax.set_xticklabels(["Jan","Feb","Mar","Apr","May","Jun",
+                        "Jul","Aug","Sep","Oct","Nov","Dec"],
+                       fontsize=10, fontweight="bold")
+    ax.tick_params(axis="x", pad=16)
+    ax.set_yticks([])
+    ax.spines["polar"].set_visible(False)
+    ax.grid(False)
+    ax.set_ylim(0, r0 + n_ribbons * (r_w + r_gap) + 0.30)
+
+    # Feb–Apr highlight wedge in an OUTER annulus
+    outer_r = r0 + n_ribbons * (r_w + r_gap) + 0.18
+    wedge = Wedge(center=(0, 0), r=outer_r + 0.28,
+                  theta1=180+60, theta2=180-0,  # placeholder; we redraw below
+                  width=0.14, facecolor="gold", edgecolor="black",
+                  lw=0.9, alpha=0.55, zorder=1)
+    # Redraw wedge with correct angular range: Feb–Apr = months 2-4.
+    # In our layout, Jan centre is at -15° (i.e. 345°). Feb centre = -45° (315°).
+    # Apr centre = -75° (285°). So Feb–Apr spans 315° to 285° going CW in
+    # screen coords, i.e. 285°–315° in standard CCW radians.
+    feb_apr_start = np.deg2rad(285)
+    feb_apr_end   = np.deg2rad(315)
+    wedge = Wedge(center=(0, 0), r=outer_r + 0.28,
+                  theta1=np.rad2deg(feb_apr_start),
+                  theta2=np.rad2deg(feb_apr_end),
+                  width=0.14, facecolor="gold", edgecolor="black",
+                  lw=0.9, alpha=0.55, zorder=1)
+    ax.add_patch(wedge)
+    ax.annotate("Feb–Apr\nminimum",
+                xy=(np.deg2rad(300), outer_r + 0.50),
+                xytext=(np.deg2rad(300), outer_r + 0.55),
+                textcoords="data",
+                ha="center", va="bottom",
+                fontsize=9, fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow",
+                          ec="black", lw=0.6),
+                zorder=8)
+
+    # ---- Ribbon legend (right side) ----
+    leg_handles = [Line2D([0], [0], color=col, lw=8) for (_, _, col) in ribbons]
+    leg_labels  = [f"{sp} · {layer}" for (sp, layer, _) in ribbons]
+    fig.legend(leg_handles, leg_labels, loc="center right",
+               bbox_to_anchor=(1.00, 0.62), fontsize=8.5,
+               title="Ribbons", title_fontsize=9,
+               frameon=True, edgecolor="black",
+               handlelength=1.4)
+
+    # ---- Bottom strip: the only seasonally sampled window ----
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.set_xlim(1, 12); ax2.set_ylim(0, 3.4)
+    ax2.axis("off")
+
+    # 12 month column markers
+    for m in range(1, 13):
+        ax2.add_patch(Rectangle((m-0.45, 0.2), 0.9, 0.9,
+                                fc="#F8F8F8", ec="#CCCCCC", lw=0.6))
+        ax2.text(m, 0.65, ["J","F","M","A","M","J","J","A","S","O","N","D"][m-1],
+                 ha="center", va="center", fontsize=8, fontweight="bold",
+                 color="#555555")
+
+    # Popović 2024 (12 months)
+    ax2.add_patch(Rectangle((0.55, 1.55), 11.9, 0.55,
+                            fc=OI["red"], ec="black", lw=0.7, alpha=0.85))
+    ax2.text(12.6, 1.82, "Popović 2024\n(12 months, sea fennel)",
+             ha="left", va="center", fontsize=8, fontweight="bold")
+
+    # Generalić Mekinić 2018 (Mar–Aug)
+    ax2.add_patch(Rectangle((2.55, 2.45), 6.0, 0.55,
+                            fc=OI["orange"], ec="black", lw=0.7, alpha=0.85))
+    ax2.text(12.6, 2.72, "Generalić Mekinić 2018\n(Mar–Aug, sea fennel)",
+             ha="left", va="center", fontsize=8, fontweight="bold")
+
+    # empty row for the gap
+    ax2.text(6.5, 0.00, "All other species × layer combinations: single time-point only",
+             ha="center", va="center", fontsize=8, style="italic",
+             color="dimgrey")
+
+    ax2.set_title("Seasonal sampling depth in the corpus",
+                  fontsize=10, fontweight="bold", pad=4)
+
+    fig.suptitle("Seasonal ribbon map: only the sea fennel metabolome is fully resolved",
+                 fontsize=12, fontweight="bold", y=0.99)
+
+    plt.savefig("figures/fig4_seasonal_ribbon.pdf")
+    plt.savefig("figures/fig4_seasonal_ribbon.png", dpi=600)
+    plt.close()
+    print("Fig 4 saved")
+
+
+# ============================================================
+# FIGURE 5 — "TERM CLUSTER MAP": co-occurrence heatmap + dendrograms
+# ============================================================
+def figure5():
+    """
+    Clustered co-occurrence heatmap of the top 30 terms, with row and column
+    dendrograms. This is the standard bibliometric visual in Nature Reviews
+    (not a force-directed network). Cell values = number of records in which
+    the row and column terms co-occur.
+    """
+    from sklearn.feature_extraction.text import CountVectorizer
+
+    findings = [
+        "April phenolic maximum chlorogenic acid",
+        "Temperature correlates cryptochlorogenic acid Feb-Apr minimum",
+        "Limonene EO sabinene",
+        "Phenolics hypoglycaemic",
+        "Culturable endophytic strains",
+        "Metabolites differential organ-specific salinity",
+        "Proteins identified energy ion homeostasis",
+        "Proteins identified carbon nitrogen coordination",
+        "OTUs compartments rhizosphere endosphere",
+    ]
+    vec = CountVectorizer(stop_words="english", max_features=40,
+                          ngram_range=(1, 1), min_df=1)
+    X = vec.fit_transform(findings).toarray()
+    terms = vec.get_feature_names_out()
+    co = X.T @ X
+    np.fill_diagonal(co, 0)
+
+    # Keep top 30 by total co-occurrence
+    order = np.argsort(co.sum(axis=0))[::-1][:30]
+    terms = terms[order]
+    co = co[np.ix_(order, order)]
+
+    # Hierarchical clustering
+    row_link = linkage(co, method="average")
+    col_link = linkage(co.T, method="average")
+    row_order = leaves_list(row_link)
+    col_order = leaves_list(col_link)
+    co_ord = co[np.ix_(row_order, col_order)]
+    terms_ord_row = terms[row_order]
+
+    # Color map: white to deep red
+    cmap = LinearSegmentedColormap.from_list("cooc",
+        ["#FFFFFF", "#FDDBC7", "#EF8A62", "#B2182B", "#67001F"])
+
+    fig = plt.figure(figsize=(11, 9.5), constrained_layout=True)
+    gs = gridspec.GridSpec(2, 2, figure=fig,
+                           width_ratios=[0.18, 1], height_ratios=[0.18, 1],
+                           wspace=0.02, hspace=0.02)
+
+    # Row dendrogram
+    ax_r = fig.add_subplot(gs[1, 0])
+    dendrogram(row_link, orientation="left", ax=ax_r, no_labels=True,
+               color_threshold=0)
+    ax_r.axis("off")
+
+    # Col dendrogram
+    ax_c = fig.add_subplot(gs[0, 1])
+    dendrogram(col_link, orientation="top", ax=ax_c, no_labels=True,
+               color_threshold=0)
+    ax_c.axis("off")
+
+    # Heatmap
+    ax_h = fig.add_subplot(gs[1, 1])
+    im = ax_h.imshow(co_ord, cmap=cmap, aspect="auto")
+    ax_h.set_xticks(range(len(terms_ord_row)))
+    ax_h.set_xticklabels(terms_ord_row, rotation=45, ha="right", fontsize=8)
+    ax_h.set_yticks(range(len(terms_ord_row)))
+    ax_h.set_yticklabels(terms_ord_row, fontsize=8)
+    ax_h.tick_params(axis="both", length=0)
+
+    # Annotate non-zero cells
+    for i in range(co_ord.shape[0]):
+        for j in range(co_ord.shape[1]):
+            v = co_ord[i, j]
+            if v > 0:
+                color = "white" if v > co_ord.max() * 0.55 else "black"
+                ax_h.text(j, i, int(v), ha="center", va="center",
+                          fontsize=7, fontweight="bold", color=color)
+
+    cb = fig.colorbar(im, ax=ax_h, fraction=0.03, pad=0.02)
+    cb.set_label("Co-occurrence count (records)", fontsize=8.5)
+    cb.ax.tick_params(labelsize=7.5)
+
+    fig.suptitle("Term co-occurrence matrix (n = 9 records, top 30 terms)",
+                 fontsize=12, fontweight="bold", y=1.00)
+
+    plt.savefig("figures/fig5_term_cluster_map.pdf")
+    plt.savefig("figures/fig5_term_cluster_map.png", dpi=600)
+    plt.close()
+    print("Fig 5 saved")
+
+
+# ============================================================
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Generating BESPOKE publication-grade figures (v3)...")
+    print("=" * 60)
+    figure1(); figure2(); figure3(); figure4(); figure5()
+    print("\nAll figures written to ./figures/")
