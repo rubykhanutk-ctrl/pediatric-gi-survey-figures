@@ -1,0 +1,285 @@
+"""
+generate_all_figures.py
+Self-contained: hard-codes the verified extraction table (Table 2)
+and generates Figures 1-5 plus the MOCI report.
+No external CSV required.
+"""
+import os
+import json
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+import networkx as nx
+from sklearn.feature_extraction.text import TfidfVectorizer
+from upsetplot import UpSet, from_indicators
+
+try:
+    from community import community_louvain
+    HAVE_LOUVAIN = True
+except ImportError:
+    HAVE_LOUVAIN = False
+    print("python-louvain not installed; network will use greedy modularity.")
+
+os.makedirs("figures", exist_ok=True)
+plt.rcParams.update({"font.size": 10, "axes.titlesize": 12, "axes.labelsize": 11})
+sns.set_style("whitegrid")
+
+# ============================================================
+# 1. HARD-CODED VERIFIED EXTRACTION TABLE (Table 2)
+# ============================================================
+records = [
+    dict(ID="CM_M1", Species="C. maritimum", Layer="Metabolomics",
+         Author="Generalić Mekinić (2018)", Platform="HPLC-DAD, FRAP, ORAC, DPPH",
+         Organ="leaf", Months=6, MonthsList=[3,4,5,6,7,8],
+         SalinityControl=False, Depth=12, Quality=3,
+         Finding="April extract highest in phenolics and chlorogenic acid; best antioxidant activity"),
+    dict(ID="CM_M2", Species="C. maritimum", Layer="Metabolomics",
+         Author="Popović (2024)", Platform="GC-MS, HPLC",
+         Organ="leaf", Months=12, MonthsList=list(range(1,13)),
+         SalinityControl=False, Depth=18, Quality=3,
+         Finding="Temperature correlates with cryptochlorogenic acid (r=0.887), chlorogenic acid (r=0.794), limonene (r=0.694); Feb-Apr minimum"),
+    dict(ID="CM_M3", Species="C. maritimum", Layer="Metabolomics",
+         Author="Generalić Mekinić (2024)", Platform="GC-MS (EO)",
+         Organ="leaf", Months=1, MonthsList=[7],
+         SalinityControl=False, Depth=35, Quality=2,
+         Finding="Limonene 24.36-93.20% of EO; sabinene 0.80-31.18%"),
+    dict(ID="CM_M4", Species="C. maritimum", Layer="Metabolomics",
+         Author="Nartea (2023)", Platform="HPLC, GC-MS",
+         Organ="leaf, flower", Months=1, MonthsList=[6],
+         SalinityControl=False, Depth=22, Quality=2,
+         Finding="Phenolic acids and flavonoids characterised; hypoglycaemic potential"),
+    dict(ID="CM_B1", Species="C. maritimum", Layer="Microbiome",
+         Author="Christakis (2020)", Platform="Culture, 16S rDNA",
+         Organ="root, leaf", Months=1, MonthsList=[5],
+         SalinityControl=False, Depth=115, Quality=2,
+         Finding="115 culturable endophytic strains; majority from roots"),
+    dict(ID="SE_M1", Species="S. europaea", Layer="Metabolomics",
+         Author="Duan (2023)", Platform="UPLC-MS (widely targeted)",
+         Organ="root, shoot", Months=1, MonthsList=[8],
+         SalinityControl=True, Depth=552, Quality=4,
+         Finding="552 metabolites detected, 500 differential; organ-specific root vs shoot partitioning"),
+    dict(ID="SE_P1", Species="S. europaea", Layer="Proteomics",
+         Author="Wang (2009)", Platform="2-DE, MALDI-TOF/TOF",
+         Organ="shoot", Months=1, MonthsList=[7],
+         SalinityControl=True, Depth=111, Quality=3,
+         Finding="196 of 1880 spots varied; 111 identified; energy and ion homeostasis"),
+    dict(ID="SE_P2", Species="S. europaea", Layer="Proteomics",
+         Author="Wang (2011)", Platform="2-DE, nanoLC-MS/MS",
+         Organ="chloroplast", Months=1, MonthsList=[7],
+         SalinityControl=True, Depth=66, Quality=3,
+         Finding="90 differential spots; 66 identified; carbon-nitrogen coordination"),
+    dict(ID="SE_B1", Species="S. europaea", Layer="Microbiome",
+         Author="Yamamoto (2018)", Platform="16S rRNA amplicon",
+         Organ="rhizosphere, root endosphere, bulk soil", Months=1, MonthsList=[9],
+         SalinityControl=False, Depth=1138, Quality=3,
+         Finding="Unique OTUs: 126 endosphere, 416 rhizosphere, 596 bulk"),
+]
+df = pd.DataFrame(records)
+
+species_order = ["C. maritimum", "S. europaea"]
+layer_order   = ["Metabolomics", "Proteomics", "Microbiome"]
+
+# ============================================================
+# 2. MOCI + GAP MATRIX REPORT
+# ============================================================
+print("="*68)
+print("Multi-Omics Coverage Index (MOCI)")
+print("="*68)
+for sp in species_order:
+    present = sum(len(df[(df.Species==sp) & (df.Layer==L)]) > 0 for L in layer_order)
+    print(f"{sp:16s}  MOCI = {present/3:.2f}  ({present}/3 layers)")
+
+print("\n" + "="*68)
+print("Gap matrix")
+print("="*68)
+for sp in species_order:
+    for L in layer_order:
+        sub = df[(df.Species==sp) & (df.Layer==L)]
+        if len(sub)==0:
+            print(f"  {sp:16s} | {L:14s} | 0 records (ABSENT)")
+        else:
+            mm = int(sub.Months.max())
+            seasonal = "seasonal" if mm>=6 else "single-season"
+            sal = "salinity-controlled" if sub.SalinityControl.any() else "no salinity control"
+            print(f"  {sp:16s} | {L:14s} | {len(sub)} rec | {mm:2d} mo | {seasonal:14s} | {sal}")
+
+# ============================================================
+# FIGURE 1 — Triple-panel evidence map
+# ============================================================
+counts = df.groupby(["Species","Layer"]).size().unstack(fill_value=0)\
+           .reindex(index=species_order, columns=layer_order, fill_value=0)
+months = df.groupby(["Species","Layer"])["Months"].max().unstack(fill_value=0)\
+           .reindex(index=species_order, columns=layer_order, fill_value=0)
+sal = (df.groupby(["Species","Layer"])["SalinityControl"]
+         .apply(lambda s: int(s.any())).unstack(fill_value=0)
+         .reindex(index=species_order, columns=layer_order, fill_value=0))
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
+panels = [
+    (counts, "Records per species × layer",      "Reds",   "Count"),
+    (months, "Max seasonal resolution (months)", "Blues",  "Months"),
+    (sal,    "Salinity controlled (1 = yes)",    "Greens", "Binary"),
+]
+for ax, (mat, title, cmap, cbl) in zip(axes, panels):
+    sns.heatmap(mat, annot=True, fmt=".0f", cmap=cmap,
+                cbar_kws={"label": cbl}, ax=ax,
+                linewidths=0.5, linecolor="white",
+                annot_kws={"fontsize": 12, "fontweight": "bold"})
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            if mat.iloc[i,j] == 0:
+                ax.text(j+0.5, i+0.5, "0\n(absent)", ha="center", va="center",
+                        fontsize=9, color="darkred", fontweight="bold")
+    ax.set_title(title, fontweight="bold")
+    ax.set_ylabel(""); ax.set_xlabel("")
+plt.suptitle("Triple-panel evidence map", fontsize=14, fontweight="bold", y=1.03)
+plt.tight_layout()
+plt.savefig("figures/fig1_triple_evidence_map.pdf", bbox_inches="tight")
+plt.savefig("figures/fig1_triple_evidence_map.png", dpi=300, bbox_inches="tight")
+plt.close()
+print("\nFigure 1 saved.")
+
+# ============================================================
+# FIGURE 2 — UpSet plot
+# ============================================================
+indicators = pd.DataFrame({
+    "C. maritimum":       df.Species.str.contains("maritimum"),
+    "S. europaea":        df.Species.str.contains("europaea"),
+    "Metabolomics":       df.Layer.str.contains("Metab"),
+    "Proteomics":         df.Layer.str.contains("Prot"),
+    "Microbiome":         df.Layer.str.contains("Micro"),
+    "Seasonal (≥6 mo)":   df.Months >= 6,
+    "Salinity controlled":df.SalinityControl,
+})
+upset_data = from_indicators(list(indicators.columns), data=indicators)
+fig = plt.figure(figsize=(13, 6))
+UpSet(upset_data, subset_size="count", show_counts=True,
+      sort_by="cardinality", min_subset_size=1).plot(fig=fig)
+plt.suptitle("UpSet decomposition of attribute combinations",
+             fontsize=14, fontweight="bold", y=1.02)
+plt.savefig("figures/fig2_upset_coverage.pdf", bbox_inches="tight")
+plt.savefig("figures/fig2_upset_coverage.png", dpi=300, bbox_inches="tight")
+plt.close()
+print("Figure 2 saved.")
+
+# ============================================================
+# FIGURE 3 — Depth–quality scatter
+# ============================================================
+layer_colors = {"Metabolomics":"#D7263D", "Proteomics":"#1B98E0", "Microbiome":"#3BB273"}
+fig, ax = plt.subplots(figsize=(9, 6.5))
+for layer, grp in df.groupby("Layer"):
+    ax.scatter(grp.Quality, grp.Depth,
+               s=grp.Months*25+80, c=layer_colors[layer],
+               alpha=0.75, edgecolors="black", linewidths=0.8, label=layer)
+for _, r in df.iterrows():
+    ax.annotate(r.ID, (r.Quality, r.Depth),
+                xytext=(6,6), textcoords="offset points", fontsize=8)
+ax.set_yscale("log")
+ax.set_xlabel("Reporting quality score (0–4)", fontweight="bold")
+ax.set_ylabel("Analytical depth (countable features, log)", fontweight="bold")
+ax.set_title("Depth–quality landscape of the verified corpus", fontweight="bold")
+ax.legend(title="Layer", loc="lower right")
+ax.grid(True, which="both", ls="--", alpha=0.3)
+deepest = df.loc[df.Depth.idxmax()]
+ax.annotate(f"Deepest: {deepest.ID} ({deepest.Depth} features)",
+            xy=(deepest.Quality, deepest.Depth), xytext=(-140, 25),
+            textcoords="offset points",
+            arrowprops=dict(arrowstyle="->", lw=1), fontsize=9, fontweight="bold")
+plt.tight_layout()
+plt.savefig("figures/fig3_depth_quality_scatter.pdf", bbox_inches="tight")
+plt.savefig("figures/fig3_depth_quality_scatter.png", dpi=300, bbox_inches="tight")
+plt.close()
+print("Figure 3 saved.")
+
+# ============================================================
+# FIGURE 4 — Circular seasonal coverage
+# ============================================================
+rings = [("C. maritimum","Metabolomics"), ("C. maritimum","Proteomics"), ("C. maritimum","Microbiome"),
+         ("S. europaea","Metabolomics"),  ("S. europaea","Proteomics"),  ("S. europaea","Microbiome")]
+ring_colors = {
+    ("C. maritimum","Metabolomics"):"#D7263D", ("C. maritimum","Proteomics"):"#F46036", ("C. maritimum","Microbiome"):"#F4A259",
+    ("S. europaea","Metabolomics"): "#1B98E0", ("S. europaea","Proteomics"): "#4EA8DE", ("S. europaea","Microbiome"): "#89C2D9",
+}
+fig, ax = plt.subplots(figsize=(8,8), subplot_kw={"projection":"polar"})
+theta = np.linspace(0, 2*np.pi, 12, endpoint=False)
+width = 2*np.pi/12 - 0.02
+for i,(sp,L) in enumerate(rings):
+    radius = 1 + i*0.8
+    sub = df[(df.Species==sp)&(df.Layer==L)]
+    covered = set()
+    for ml in sub.MonthsList:
+        covered.update(ml)
+    for m_idx, m_num in enumerate(range(1,13)):
+        if m_num in covered:
+            ax.bar(theta[m_idx], 0.7, width=width, bottom=radius,
+                   color=ring_colors[(sp,L)], alpha=0.9, edgecolor="white", linewidth=0.8)
+        else:
+            ax.bar(theta[m_idx], 0.7, width=width, bottom=radius,
+                   color="lightgrey", alpha=0.3, edgecolor="white", linewidth=0.4)
+ax.set_xticks(theta)
+ax.set_xticklabels(["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], fontsize=10)
+ax.set_yticks([])
+ax.set_ylim(0, 1 + len(rings)*0.8 + 0.8)
+for i,(sp,L) in enumerate(rings):
+    ax.text(np.pi*1.5 + 0.15, 1 + i*0.8 + 0.35, f"{sp}\n{L}",
+            fontsize=8, ha="left", va="center")
+ax.set_title("Circular seasonal coverage map", fontweight="bold", pad=18)
+plt.tight_layout()
+plt.savefig("figures/fig4_circular_seasonal.pdf", bbox_inches="tight")
+plt.savefig("figures/fig4_circular_seasonal.png", dpi=300, bbox_inches="tight")
+plt.close()
+print("Figure 4 saved.")
+
+# ============================================================
+# FIGURE 5 — Keyword co-occurrence network
+# ============================================================
+corpus = df.Finding.fillna("").tolist()
+vec = TfidfVectorizer(stop_words="english", max_features=200,
+                      ngram_range=(1,2), min_df=1)
+tfidf = vec.fit_transform(corpus)
+terms = vec.get_feature_names_out()
+co = (tfidf.T @ tfidf).toarray()
+np.fill_diagonal(co, 0)
+co_norm = co / co.max()
+
+thr = 0.10
+G = nx.Graph()
+for i,t in enumerate(terms):
+    G.add_node(t, freq=int(tfidf[:,i].sum() > 0))
+for i in range(len(terms)):
+    for j in range(i+1, len(terms)):
+        if co_norm[i,j] > thr:
+            G.add_edge(terms[i], terms[j], weight=float(co_norm[i,j]))
+
+if G.number_of_edges() > 0:
+    if HAVE_LOUVAIN:
+        partition = community_louvain.best_partition(G)
+    else:
+        from networkx.algorithms.community import greedy_modularity_communities
+        partition = {}
+        for cid, comm in enumerate(greedy_modularity_communities(G)):
+            for n in comm: partition[n] = cid
+    cmap = plt.get_cmap("tab10")
+    node_colors = [cmap(partition[n] % 10) for n in G.nodes()]
+else:
+    node_colors = ["grey"] * G.number_of_nodes()
+
+pos = nx.spring_layout(G, k=0.8, seed=42, weight="weight")
+fig, ax = plt.subplots(figsize=(12,9))
+sizes  = [G.nodes[n]["freq"]*300 + 100 for n in G.nodes()]
+widths = [G[u][v]["weight"]*4 for u,v in G.edges()]
+nx.draw_networkx_edges(G, pos, width=widths, alpha=0.35, ax=ax)
+nx.draw_networkx_nodes(G, pos, node_size=sizes, node_color=node_colors,
+                       alpha=0.85, edgecolors="black", linewidths=0.6, ax=ax)
+nx.draw_networkx_labels(G, pos, font_size=8, ax=ax)
+ax.set_title("Keyword co-occurrence network (exploratory; n = 9 records)", fontweight="bold")
+ax.axis("off")
+plt.tight_layout()
+plt.savefig("figures/fig5_keyword_network.pdf", bbox_inches="tight")
+plt.savefig("figures/fig5_keyword_network.png", dpi=300, bbox_inches="tight")
+plt.close()
+print("Figure 5 saved.")
+print("\nAll figures generated in ./figures/")
